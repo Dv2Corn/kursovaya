@@ -7,6 +7,8 @@
   * объекты: агент заносит эксклюзив через форму, модератор публикует или
     отклоняет его; опубликованный объект попадает в закрытый каталог;
   * закрытый каталог виден только клиентам с действующей подпиской;
+  * регистрация по почте без перебора адресов: ответ одинаковый для нового и
+    занятого адреса, ключ клиента уходит только письмом (очередь outbox);
   * подписка: заказ → уведомление платёжного агрегатора с HMAC-подписью
     (или платёж внутренней валютой мессенджера) → автоматическая активация;
     повтор уведомления не даёт второго начисления (ограничение уникальности
@@ -162,6 +164,13 @@ CREATE TABLE IF NOT EXISTS deals (
     commission    INTEGER NOT NULL,          -- рубли
     closed_at     REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outbox (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         TEXT NOT NULL,             -- «исходящие письма» демо вместо почтового сервиса
+    kind          TEXT NOT NULL,             -- client_key | already_registered
+    body          TEXT NOT NULL,
+    created_at    REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            REAL NOT NULL,
@@ -173,7 +182,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 _COUNTABLE = {
     "agents", "clients", "listings", "orders", "payments", "subscriptions",
-    "saved_searches", "notifications", "listing_views", "viewings", "deals", "audit_log",
+    "saved_searches", "notifications", "listing_views", "viewings", "deals", "outbox", "audit_log",
 }
 
 
@@ -610,39 +619,67 @@ class AgencyService:
         return {"listing_id": listing_id, "status": LISTING_SOLD}
 
     # ------------------------------------------------------------ orders
-    def create_order(self, plan: str, email: Optional[str] = None, client_key: Optional[str] = None) -> dict:
-        """Заказ подписки. Новый клиент получает ключ один раз; продление — по ключу."""
-        if plan not in PLANS:
-            raise ServiceError(400, "invalid_plan")
-        new_key = None
-        order_id = _new_id("ord")
+    REGISTRATION_ACCEPTED = {
+        "status": "accepted",
+        "message": "Если адрес новый, ключ доступа отправлен на почту.",
+    }
+
+    def register_client(self, email: str) -> dict:
+        """Регистрация по почте. Ответ одинаковый для нового и занятого адреса.
+
+        Ключ клиента не возвращается в ответе: он уходит письмом на указанный
+        адрес (в демо — в таблицу outbox). Поэтому по ответу нельзя ни узнать,
+        зарегистрирован ли адрес, ни получить ключ к чужой почте.
+        """
+        email = (email or "").strip().lower()
+        if not _EMAIL_RE.match(email):
+            raise ServiceError(400, "invalid_email")
+        now = self._clock()
         with self._tx():
-            if client_key:
-                client_id = self._client(client_key)["id"]
+            if self._db.execute("SELECT 1 FROM clients WHERE email = ?", (email,)).fetchone():
+                # Хозяину адреса — уведомление о попытке; второй ключ не выдаём.
+                self._db.execute(
+                    "INSERT INTO outbox (email, kind, body, created_at) VALUES (?, ?, ?, ?)",
+                    (email, "already_registered",
+                     "Адрес уже зарегистрирован. Если это были не вы, просто проигнорируйте письмо.", now),
+                )
+                self._audit("anonymous", "registration_repeat")
             else:
-                email = (email or "").strip().lower()
-                if not _EMAIL_RE.match(email):
-                    raise ServiceError(400, "invalid_email")
-                if self._db.execute("SELECT 1 FROM clients WHERE email = ?", (email,)).fetchone():
-                    # Ключ этому адресу уже выдан; второй ключ по одной почте не выдаём.
-                    raise ServiceError(409, "client_exists")
                 client_id = _new_id("cl")
-                new_key = secrets.token_urlsafe(24)
+                key = secrets.token_urlsafe(24)
                 self._db.execute(
                     "INSERT INTO clients (id, email, key_hash, created_at) VALUES (?, ?, ?, ?)",
-                    (client_id, email, _sha256(new_key), self._clock()),
+                    (client_id, email, _sha256(key), now),
+                )
+                self._db.execute(
+                    "INSERT INTO outbox (email, kind, body, created_at) VALUES (?, ?, ?, ?)",
+                    (email, "client_key", key, now),
                 )
                 self._audit("client:" + client_id, "client_registered")
-            amount = PLANS[plan]["amount"]
+        return dict(self.REGISTRATION_ACCEPTED)
+
+    def outbox_for(self, email: str) -> List[dict]:
+        """Письма, «отправленные» на адрес (в настоящей системе — почтовый сервис)."""
+        rows = self._all(
+            "SELECT kind, body, created_at FROM outbox WHERE email = ? ORDER BY id",
+            ((email or "").strip().lower(),),
+        )
+        return [dict(r) for r in rows]
+
+    def create_order(self, plan: str, client_key: str) -> dict:
+        """Заказ подписки (первый или продление) — только по ключу клиента."""
+        client_id = self._client(client_key)["id"]
+        if plan not in PLANS:
+            raise ServiceError(400, "invalid_plan")
+        order_id = _new_id("ord")
+        amount = PLANS[plan]["amount"]
+        with self._tx():
             self._db.execute(
                 "INSERT INTO orders (id, client_id, plan, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (order_id, client_id, plan, amount, ORDER_PENDING, self._clock()),
             )
             self._audit("client:" + client_id, "order_created", order_id=order_id, plan=plan, amount=amount)
-        result = {"order_id": order_id, "plan": plan, "amount": amount, "units": PLANS[plan]["units"]}
-        if new_key:
-            result["client_key"] = new_key
-        return result
+        return {"order_id": order_id, "plan": plan, "amount": amount, "units": PLANS[plan]["units"]}
 
     def get_order(self, order_id: str, client_key: str) -> dict:
         client = self._client(client_key)

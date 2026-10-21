@@ -58,14 +58,28 @@ class ServiceTestCase(unittest.TestCase):
         self.svc.close()
 
     # -- помощники
+    def register(self, email="client@example.org", svc=None):
+        """Регистрация и «чтение письма»: ключ клиента приходит только в outbox."""
+        svc = svc or self.svc
+        svc.register_client(email)
+        return [m for m in svc.outbox_for(email) if m["kind"] == "client_key"][-1]["body"]
+
+    def order(self, plan="1m", email="client@example.org"):
+        keys = self.__dict__.setdefault("_keys", {})
+        if email not in keys:
+            keys[email] = self.register(email)
+        order = self.svc.create_order(plan, keys[email])
+        order["client_key"] = keys[email]
+        return order
+
     def pay(self, order, external_id="pay-1", amount=None, secret=SECRET, status="succeeded"):
         body = webhook_body(order["order_id"], external_id,
                             order["amount"] if amount is None else amount, status)
         return self.svc.handle_gateway_webhook(body, sign_payload(secret, body))
 
     def subscriber(self, email="client@example.org", plan="1m"):
-        order = self.svc.create_order(plan, email=email)
-        self.pay(order, external_id="pay-" + email)
+        order = self.order(plan, email)
+        self.pay(order, external_id="pay-" + email + "-" + order["order_id"])
         return order["client_key"]
 
     def published(self, **overrides):
@@ -139,7 +153,7 @@ class ListingTests(ServiceTestCase):
 class CatalogAccessTests(ServiceTestCase):
     def test_catalog_closed_without_subscription(self):
         self.published()
-        order = self.svc.create_order("1m", email="guest@example.org")
+        order = self.order("1m", "guest@example.org")
         with self.assertRaises(ServiceError) as ctx:
             self.svc.catalog(order["client_key"])
         self.assertEqual((ctx.exception.status, ctx.exception.code), (403, "subscription_required"))
@@ -174,32 +188,39 @@ class CatalogAccessTests(ServiceTestCase):
 
 
 class OrderAndPaymentTests(ServiceTestCase):
-    def test_order_uses_plan_price_and_returns_key_once(self):
-        order = self.svc.create_order("3m", email="Client@Example.org")
+    def test_order_uses_plan_price_and_requires_key(self):
+        order = self.order("3m", "Client@Example.org")
         self.assertEqual(order["amount"], PLANS["3m"]["amount"])
-        self.assertTrue(order["client_key"])
         self.assertEqual(self.svc.order_status(order["order_id"]), ORDER_PENDING)
-        renewal = self.svc.create_order("1m", client_key=order["client_key"])
-        self.assertNotIn("client_key", renewal)
-
-    def test_second_key_for_same_email_refused(self):
-        self.svc.create_order("1m", email="client@example.org")
+        self.assertNotIn("client_key", self.svc.create_order("1m", order["client_key"]))
         with self.assertRaises(ServiceError) as ctx:
-            self.svc.create_order("1m", email="CLIENT@example.org")
-        self.assertEqual((ctx.exception.status, ctx.exception.code), (409, "client_exists"))
+            self.svc.create_order("1m", "")
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_registration_answer_same_for_new_and_taken_email(self):
+        first = self.svc.register_client("client@example.org")
+        second = self.svc.register_client("CLIENT@example.org")
+        self.assertEqual(first, second)                       # по ответу не понять, занят ли адрес
+        self.assertNotIn("key", json.dumps(first))            # ключа в ответе нет
+        self.assertEqual(self.svc.count("clients"), 1)        # второго ключа на ту же почту нет
+        kinds = [m["kind"] for m in self.svc.outbox_for("client@example.org")]
+        self.assertEqual(kinds, ["client_key", "already_registered"])
+        key = self.svc.outbox_for("client@example.org")[0]["body"]
+        self.assertNotIn(key, json.dumps(self.svc.audit_entries(), ensure_ascii=False))
 
     def test_invalid_plan_and_email_rejected(self):
-        for kwargs, code in (({"plan": "7d", "email": "a@example.org"}, "invalid_plan"),
-                             ({"plan": "1m", "email": "not-an-email"}, "invalid_email")):
-            with self.subTest(code=code):
-                with self.assertRaises(ServiceError) as ctx:
-                    self.svc.create_order(**kwargs)
-                self.assertEqual(ctx.exception.code, code)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.register_client("not-an-email")
+        self.assertEqual(ctx.exception.code, "invalid_email")
+        key = self.register()
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.create_order("7d", key)
+        self.assertEqual(ctx.exception.code, "invalid_plan")
         self.assertEqual(self.svc.count("orders"), 0)
-        self.assertEqual(self.svc.count("clients"), 0)
+        self.assertEqual(self.svc.count("clients"), 1)
 
     def test_bad_signature_rejected_and_logged(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         with self.assertRaises(ServiceError) as ctx:
             self.pay(order, secret="another-secret")
         self.assertEqual(ctx.exception.status, 403)
@@ -207,7 +228,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertIn("webhook_rejected", self.actions())
 
     def test_tampered_body_rejected(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         body = webhook_body(order["order_id"], "pay-1", order["amount"])
         signature = sign_payload(SECRET, body)
         with self.assertRaises(ServiceError):
@@ -215,7 +236,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertEqual(self.svc.count("payments"), 0)
 
     def test_payment_activates_subscription_immediately(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         res = self.pay(order)
         self.assertEqual(res.result, "processed")
         self.assertEqual(self.svc.order_status(order["order_id"]), ORDER_PAID)
@@ -224,7 +245,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertTrue(self.svc.get_order(order["order_id"], order["client_key"])["subscription_active"])
 
     def test_repeated_webhook_credits_once(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         self.assertEqual(self.pay(order, external_id="pay-42").result, "processed")
         expires = self.svc.subscription(order["client_key"])["expires_at"]
         for _ in range(3):
@@ -233,7 +254,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertEqual(self.svc.subscription(order["client_key"])["expires_at"], expires)
 
     def test_extra_payment_for_paid_order_does_not_extend(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         self.pay(order, external_id="pay-1")
         res = self.pay(order, external_id="pay-2")
         self.assertEqual(res.result, "extra_payment")
@@ -241,7 +262,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertIn("payment_extra_for_paid_order", self.actions())
 
     def test_amount_mismatch_not_activated(self):
-        order = self.svc.create_order("12m", email="client@example.org")
+        order = self.order("12m", "client@example.org")
         with self.assertRaises(ServiceError) as ctx:
             self.pay(order, amount=100)
         self.assertEqual(ctx.exception.status, 422)
@@ -249,7 +270,7 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertEqual(self.svc.count("payments"), 0)
 
     def test_failed_status_ignored_and_malformed_payload_rejected(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         self.assertEqual(self.pay(order, status="failed").result, "ignored")
         self.assertEqual(self.svc.order_status(order["order_id"]), ORDER_PENDING)
         body = b'{"order_id": "x"'
@@ -258,16 +279,16 @@ class OrderAndPaymentTests(ServiceTestCase):
         self.assertEqual(ctx.exception.code, "bad_payload")
 
     def test_renewal_extends_from_current_expiry(self):
-        first = self.svc.create_order("1m", email="client@example.org")
+        first = self.order("1m", "client@example.org")
         self.pay(first, external_id="pay-1")
         self.clock.advance(10 * DAY)
-        second = self.svc.create_order("3m", client_key=first["client_key"])
+        second = self.svc.create_order("3m", first["client_key"])
         self.pay(second, external_id="pay-2")
         self.assertEqual(self.svc.subscription(first["client_key"])["expires_at"], START + 30 * DAY + 90 * DAY)
 
     def test_foreign_order_not_visible(self):
-        mine = self.svc.create_order("1m", email="a@example.org")
-        other = self.svc.create_order("1m", email="b@example.org")
+        mine = self.order("1m", "a@example.org")
+        other = self.order("1m", "b@example.org")
         with self.assertRaises(ServiceError) as ctx:
             self.svc.get_order(mine["order_id"], other["client_key"])
         self.assertEqual(ctx.exception.status, 404)
@@ -279,14 +300,14 @@ class MessengerPaymentTests(ServiceTestCase):
                            "units": order["units"] if units is None else units}).encode("utf-8")
 
     def test_messenger_payment_activates_and_is_idempotent(self):
-        order = self.svc.create_order("3m", email="client@example.org")
+        order = self.order("3m", "client@example.org")
         self.assertEqual(self.svc.handle_messenger_payment(MSG_SECRET, self.body(order)).result, "processed")
         self.assertEqual(self.svc.handle_messenger_payment(MSG_SECRET, self.body(order)).result, "duplicate")
         self.assertEqual(self.svc.subscription(order["client_key"])["expires_at"], START + 90 * DAY)
         self.assertEqual(self.svc.metrics()["subscription_revenue_units"], PLANS["3m"]["units"])
 
     def test_messenger_wrong_secret_or_amount(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         with self.assertRaises(ServiceError) as ctx:
             self.svc.handle_messenger_payment("guess", self.body(order))
         self.assertEqual(ctx.exception.status, 403)
@@ -298,7 +319,7 @@ class MessengerPaymentTests(ServiceTestCase):
     def test_messenger_disabled_without_secret(self):
         svc = AgencyService(":memory:", SECRET, clock=self.clock)
         try:
-            order = svc.create_order("1m", email="client@example.org")
+            order = svc.create_order("1m", self.register(svc=svc))
             with self.assertRaises(ServiceError) as ctx:
                 svc.handle_messenger_payment("", self.body(order))
             self.assertEqual(ctx.exception.status, 403)
@@ -308,9 +329,9 @@ class MessengerPaymentTests(ServiceTestCase):
 
 class ReconcileTests(ServiceTestCase):
     def test_stale_order_cancelled_fresh_kept(self):
-        stale = self.svc.create_order("1m", email="a@example.org")
+        stale = self.order("1m", "a@example.org")
         self.clock.advance(25 * 60)
-        fresh = self.svc.create_order("1m", email="b@example.org")
+        fresh = self.order("1m", "b@example.org")
         self.clock.advance(10 * 60)  # первому 35 мин, второму 10 мин
         report = self.svc.reconcile_stale_orders()
         self.assertEqual(report, {"checked": 1, "paid": 0, "cancelled": 1, "duplicate": 0})
@@ -318,7 +339,7 @@ class ReconcileTests(ServiceTestCase):
         self.assertEqual(self.svc.order_status(fresh["order_id"]), ORDER_PENDING)
 
     def test_reconcile_finds_lost_payment_and_late_webhook_is_duplicate(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         self.clock.advance(40 * 60)
         report = self.svc.reconcile_stale_orders(
             lambda _id: {"status": "succeeded", "external_id": "pay-lost", "amount": order["amount"]})
@@ -328,7 +349,7 @@ class ReconcileTests(ServiceTestCase):
         self.assertEqual(self.svc.count("payments"), 1)
 
     def test_late_payment_after_cancel_still_activates(self):
-        order = self.svc.create_order("1m", email="client@example.org")
+        order = self.order("1m", "client@example.org")
         self.clock.advance(31 * 60)
         self.svc.reconcile_stale_orders()
         self.assertEqual(self.pay(order, external_id="pay-late").result, "processed")
@@ -336,7 +357,7 @@ class ReconcileTests(ServiceTestCase):
         self.assertIn("late_payment", self.actions())
 
     def test_reconcile_is_repeatable(self):
-        self.svc.create_order("1m", email="client@example.org")
+        self.order("1m", "client@example.org")
         self.clock.advance(31 * 60)
         self.assertEqual(self.svc.reconcile_stale_orders()["cancelled"], 1)
         self.assertEqual(self.svc.reconcile_stale_orders()["checked"], 0)
@@ -351,7 +372,7 @@ class MatchingTests(ServiceTestCase):
         self.svc.save_search(too_cheap, {"price_max": 5_000_000})
         other_district = self.subscriber("north@example.org")
         self.svc.save_search(other_district, {"district": "Северный"})
-        not_paid = self.svc.create_order("1m", email="guest@example.org")["client_key"]
+        not_paid = self.order("1m", "guest@example.org")["client_key"]
         self.svc.save_search(not_paid, {"district": "Центральный"})
 
         listing_id = self.svc.submit_listing(self.agent, FLAT)["listing_id"]
@@ -444,7 +465,7 @@ class ViewingTests(ServiceTestCase):
                 self.assertEqual(ctx.exception.code, "invalid_slot")
 
     def test_viewing_requires_subscription(self):
-        guest = self.svc.create_order("1m", email="guest@example.org")["client_key"]
+        guest = self.order("1m", "guest@example.org")["client_key"]
         with self.assertRaises(ServiceError) as ctx:
             self.svc.request_viewing(guest, self.listing, self.slot)
         self.assertEqual(ctx.exception.status, 403)
@@ -489,7 +510,7 @@ class LifecycleTests(ServiceTestCase):
         self.assertEqual(self.svc.subscription(key)["status"], SUB_EXPIRED)
         self.assertIn("subscription_expired", self.actions())
         # Продление после окончания считается от сегодняшнего дня.
-        renewal = self.svc.create_order("1m", client_key=key)
+        renewal = self.svc.create_order("1m", key)
         self.pay(renewal, external_id="pay-renew")
         self.assertEqual(self.svc.subscription(key), {"expires_at": self.clock.now + 30 * DAY,
                                                       "status": SUB_ACTIVE})
@@ -507,13 +528,13 @@ class LifecycleTests(ServiceTestCase):
 
 class HealthAuditMetricsTests(ServiceTestCase):
     def test_health(self):
-        self.svc.create_order("1m", email="client@example.org")
+        self.order("1m", "client@example.org")
         self.svc.submit_listing(self.agent, FLAT)
         self.assertEqual(self.svc.health(), {"status": "ok", "database": "ok", "pending_orders": 1,
                                              "pending_moderation": 1, "queued_notifications": 0})
 
     def test_audit_has_no_secrets_or_email(self):
-        order = self.svc.create_order("1m", email="private.person@example.org")
+        order = self.order("1m", "private.person@example.org")
         self.pay(order)
         agent = self.svc.create_agent("Агент Б")
         dump = json.dumps(self.svc.audit_entries(limit=1000), ensure_ascii=False)
@@ -529,7 +550,7 @@ class HealthAuditMetricsTests(ServiceTestCase):
         self.assertEqual(entries["agent_created"], "owner")
 
     def test_run_jobs_combines_all_scheduled_work(self):
-        self.svc.create_order("1m", email="a@example.org")
+        self.order("1m", "a@example.org")
         self.clock.advance(31 * 60)
         report = self.svc.run_jobs()
         self.assertEqual(report["reconcile"]["cancelled"], 1)

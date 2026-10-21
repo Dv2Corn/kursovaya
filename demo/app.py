@@ -10,7 +10,8 @@
 
 Эндпоинты (заголовки авторизации — в скобках):
     GET  /health                              состояние сервиса и базы
-    POST /orders                              заказ подписки {"plan", "email"} или (X-Client-Key) для продления
+    POST /clients                             регистрация {"email"} → 202, ключ уходит письмом
+    POST /orders                              заказ подписки {"plan"} (X-Client-Key), в т. ч. продление
     GET  /orders/<id>                         статус заказа (X-Client-Key)
     POST /webhooks/payment                    уведомление агрегатора (X-Signature: HMAC-SHA256 тела)
     POST /webhooks/messenger                  платёж валютой мессенджера (X-Messenger-Secret)
@@ -116,10 +117,10 @@ def make_handler(service: AgencyService, admin_tokens: Dict[str, str]):
                 return 200, service.health()
 
             # --- клиент: подписка и оплата
+            if method == "POST" and path == "/clients":
+                return 202, service.register_client(str(self._json().get("email", "")))
             if method == "POST" and path == "/orders":
-                data = self._json()
-                return 201, service.create_order(
-                    str(data.get("plan", "")), email=data.get("email"), client_key=client_key or None)
+                return 201, service.create_order(str(self._json().get("plan", "")), client_key)
             if method == "GET" and m(r"/orders/([\w-]+)"):
                 return 200, service.get_order(m(r"/orders/([\w-]+)").group(1), client_key)
             if method == "POST" and path == "/webhooks/payment":

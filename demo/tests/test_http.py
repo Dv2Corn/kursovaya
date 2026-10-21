@@ -56,10 +56,18 @@ class HttpTestCase(unittest.TestCase):
         self.assertEqual(status, 201)
         return {"X-Agent-Token": agent["agent_token"]}
 
-    def new_subscriber(self, email="client@example.org"):
-        _, order = self.request("POST", "/orders", {"email": email, "plan": "1m"})
-        self.assertEqual(self.webhook(order, "pay-" + email)[1]["result"], "processed")
-        return {"X-Client-Key": order["client_key"]}
+    def register(self, email="client@example.org"):
+        """Регистрация по HTTP; ключ «приходит письмом» — читаем его из outbox демо."""
+        status, payload = self.request("POST", "/clients", {"email": email})
+        self.assertEqual(status, 202)
+        key = [m for m in self.svc.outbox_for(email) if m["kind"] == "client_key"][-1]["body"]
+        return {"X-Client-Key": key}
+
+    def order(self, plan="1m", email="client@example.org"):
+        client = self.register(email)
+        status, order = self.request("POST", "/orders", {"plan": plan}, client)
+        self.assertEqual(status, 201)
+        return order, client
 
 
 class HttpFlowTests(HttpTestCase):
@@ -70,8 +78,7 @@ class HttpFlowTests(HttpTestCase):
     def test_full_flow_listing_subscription_catalog_viewing(self):
         agent = self.new_agent()
         # Клиент без подписки: каталог закрыт.
-        _, order = self.request("POST", "/orders", {"email": "client@example.org", "plan": "3m"})
-        client = {"X-Client-Key": order["client_key"]}
+        order, client = self.order("3m")
         status, payload = self.request("GET", "/catalog", headers=client)
         self.assertEqual((status, payload["error"]), (403, "subscription_required"))
         self.assertEqual(self.request("POST", "/searches", {"district": "центральный"}, client)[0], 201)
@@ -101,7 +108,7 @@ class HttpFlowTests(HttpTestCase):
                          (200, 1, 1))
 
     def test_bad_signature_returns_403(self):
-        _, order = self.request("POST", "/orders", {"email": "client@example.org", "plan": "1m"})
+        order, _ = self.order("1m")
         status, payload = self.webhook(order, secret="wrong-secret")
         self.assertEqual((status, payload["error"]), (403, "bad_signature"))
         self.assertEqual(self.svc.order_status(order["order_id"]), "pending")
@@ -109,23 +116,34 @@ class HttpFlowTests(HttpTestCase):
         self.assertEqual(status, 403)
 
     def test_duplicate_webhook_single_credit(self):
-        _, order = self.request("POST", "/orders", {"email": "client@example.org", "plan": "3m"})
+        order, _ = self.order("3m")
         self.assertEqual(self.webhook(order, "pay-7")[1]["result"], "processed")
         self.assertEqual(self.webhook(order, "pay-7")[1]["result"], "duplicate")
         self.assertEqual(self.svc.count("payments"), 1)
 
     def test_messenger_payment_endpoint(self):
-        _, order = self.request("POST", "/orders", {"email": "client@example.org", "plan": "1m"})
+        order, _ = self.order("1m")
         body = {"order_id": order["order_id"], "charge_id": "ch-1", "units": order["units"]}
         self.assertEqual(self.request("POST", "/webhooks/messenger", body, {"X-Messenger-Secret": "nope"})[0], 403)
         status, res = self.request("POST", "/webhooks/messenger", body, {"X-Messenger-Secret": MSG_SECRET})
         self.assertEqual((status, res["result"]), (200, "processed"))
 
+    def test_registration_does_not_reveal_email_or_key(self):
+        first = self.request("POST", "/clients", {"email": "client@example.org"})
+        second = self.request("POST", "/clients", {"email": "client@example.org"})
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], 202)
+        self.assertNotIn("key", json.dumps(first[1]))
+        self.assertEqual(self.request("POST", "/orders", {"plan": "1m"})[0], 401)
+
     def test_bad_input(self):
-        status, payload = self.request("POST", "/orders", {"email": "client@example.org", "plan": "forever"})
+        client = self.register()
+        status, payload = self.request("POST", "/orders", {"plan": "forever"}, client)
         self.assertEqual((status, payload["error"]), (400, "invalid_plan"))
-        status, payload = self.request("POST", "/orders", b"not json", {"Content-Type": "application/json"})
+        status, payload = self.request("POST", "/orders", b"not json", dict(client, **{"Content-Type": "application/json"}))
         self.assertEqual((status, payload["error"]), (400, "bad_json"))
+        status, payload = self.request("POST", "/clients", {"email": "nope"})
+        self.assertEqual((status, payload["error"]), (400, "invalid_email"))
         status, payload = self.request("POST", "/listings", dict(FLAT, rooms=99), self.new_agent())
         self.assertEqual((status, payload["error"]), (400, "invalid_rooms"))
         self.assertEqual(self.request("GET", "/nowhere")[0], 404)
