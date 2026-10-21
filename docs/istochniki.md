@@ -1,7 +1,9 @@
 # Список использованных источников
 
 Нумерация соответствует ссылкам в тексте работы. Оформление — по образцу
-ГОСТ Р 7.0.100-2018 в упрощённом виде.
+ГОСТ Р 7.0.100-2018 в упрощённом виде. Нормативные правовые акты
+приведены по официальным наименованиям; при использовании работы следует
+сверяться с их действующей редакцией.
 
 1. Westerman G., Bonnet D., McAfee A. Leading Digital: Turning Technology
    into Business Transformation. — Boston: Harvard Business Review Press,
@@ -55,3 +57,35 @@
     2013.
 21. Fowler M. StranglerFigApplication [Электронный ресурс] //
     martinfowler.com. — 2004. — URL: https://martinfowler.com/bliki/StranglerFigApplication.html
+22. Tzuo T., Weisert G. Subscribed: Why the Subscription Model Will Be Your
+    Company's Future — and What to Do about It. — New York: Portfolio /
+    Penguin, 2018.
+23. Osterwalder A., Pigneur Y. Business Model Generation: A Handbook for
+    Visionaries, Game Changers, and Challengers. — Hoboken: John Wiley &
+    Sons, 2010.
+24. Parker G. G., Van Alstyne M. W., Choudary S. P. Platform Revolution:
+    How Networked Markets Are Transforming the Economy — and How to Make
+    Them Work for You. — New York: W. W. Norton & Company, 2016.
+25. Brealey R. A., Myers S. C., Allen F. Principles of Corporate Finance. —
+    12th ed. — New York: McGraw-Hill Education, 2017.
+26. Федеральный закон от 27.07.2006 № 152-ФЗ «О персональных данных».
+27. Федеральный закон от 13.03.2006 № 38-ФЗ «О рекламе».
+28. Закон Российской Федерации от 07.02.1992 № 2300-1 «О защите прав
+    потребителей».
+29. Федеральный закон от 22.05.2003 № 54-ФЗ «О применении
+    контрольно-кассовой техники при осуществлении расчётов в Российской
+    Федерации».
+30. Федеральный закон от 30.12.2004 № 214-ФЗ «Об участии в долевом
+    строительстве многоквартирных домов и иных объектов недвижимости и о
+    внесении изменений в некоторые законодательные акты Российской
+    Федерации».
+31. Гражданский кодекс Российской Федерации. Часть первая: Федеральный
+    закон от 30.11.1994 № 51-ФЗ (ст. 437 «Приглашение делать оферты.
+    Публичная оферта»); часть вторая: Федеральный закон от 26.01.1996
+    № 14-ФЗ (гл. 39 «Возмездное оказание услуг»).
+32. Baxter R. K. The Membership Economy: Find Your Super Users, Master the
+    Forever Transaction, and Build Recurring Revenue. — New York:
+    McGraw-Hill Education, 2015.
+33. Ries E. The Lean Startup: How Today's Entrepreneurs Use Continuous
+    Innovation to Create Radically Successful Businesses. — New York: Crown
+    Business, 2011.
